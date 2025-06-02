@@ -64,10 +64,12 @@ def _to_feet(raw) -> int | None:
         except (TypeError, ValueError):
             return None
 
+        # Only convert if unit is actually metres
         if unit.startswith("met"):
             return int(round(val_f / 0.3048))
-        # for anything else (FOOT / BLANK) assume already feet
-        return int(round(val_f))
+        else:
+            # For FOOT or any other unit, assume already feet
+            return int(round(val_f))
 
     # 2) Already numeric -----------------------------------------------------
     if isinstance(raw, (int, float)):
@@ -88,42 +90,90 @@ def _to_feet(raw) -> int | None:
 def _fmt_pct(val: float | None) -> str | None:
     if val is None:
         return None
+    
+    # Convert string to float if needed
+    try:
+        if isinstance(val, str):
+            # Strip % sign if present and convert to float
+            val_clean = val.strip().rstrip('%')
+            val = float(val_clean)
+        elif not isinstance(val, (int, float)):
+            return None
+    except (ValueError, TypeError):
+        return None
+        
     if val > 1.01:  # already percent units (e.g. 65.4)
         return f"{val:.2f}%"
     return f"{val*100:.2f}%"
 
 def _coords_from_spida_location(loc: dict) -> Optional[Coord]:
-    """Extract coordinates from SPIDA location object.
-
-    The newer SPIDAcalc JSON exports embed location coordinates in a GeoJSON
-    object at ``location["geographicCoordinate"]["coordinates"]`` or
-    sometimes ``location["mapLocation"]["coordinates"]``.  These are given in
-    the standard GeoJSON order of ``[longitude, latitude]``.
-
-    Older exports may still expose flat ``latitude``/``longitude`` keys (or the
-    short forms ``lat``/``lon``).  This helper now supports all of these
-    variants.
     """
-    # 1. Simple flat keys ----------------------------------------------------
+    Return (lat, lon) or None. Tries multiple sources:
+    1. location.geographicCoordinate.coordinates   (GeoJSON order [lon, lat])
+    2. location.mapLocation.coordinates            (same)
+    3. flat latitude/longitude keys
+    4. measured → geographicCoordinate fallback
+    
+    Includes heuristic coordinate swapping if values appear reversed.
+    """
+    def _geo_coords(block):
+        """Extract coordinates from a GeoJSON-style block."""
+        if isinstance(block, dict):
+            coords = block.get("coordinates")
+            if isinstance(coords, (list, tuple)) and len(coords) == 2:
+                lon, lat = coords              # GeoJSON is lon,lat
+                try:
+                    return float(lat), float(lon)
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    # 1-2. Try recommended layer GeoJSON blocks first
+    for key in ("geographicCoordinate", "mapLocation"):
+        c = _geo_coords(loc.get(key))
+        if c:
+            return c
+
+    # 3. Try flat latitude/longitude keys
     lat = loc.get("latitude") or loc.get("lat")
     lon = loc.get("longitude") or loc.get("lon") or loc.get("long")
-    if lat and lon:
-        try:
-            return (float(lat), float(lon))
-        except (ValueError, TypeError):
-            pass  # fall through to GeoJSON parsing
+    try:
+        if lat and lon:
+            lat_f, lon_f = float(lat), float(lon)
+            # Heuristic swap if the file was exported in lat,lon order instead of GeoJSON lon,lat
+            if abs(lat_f) < 5 and abs(lon_f) > 20:   # looks like lat,lon was swapped to lon,lat
+                lat_f, lon_f = lon_f, lat_f
+            return lat_f, lon_f
+    except (TypeError, ValueError):
+        pass
 
-    # 2. GeoJSON coordinate arrays ------------------------------------------
-    for key in ("geographicCoordinate", "mapLocation"):
-        geo = loc.get(key)
-        if isinstance(geo, dict):
-            coords = geo.get("coordinates")
-            if (isinstance(coords, (list, tuple)) and len(coords) == 2):
-                lon_val, lat_val = coords  # GeoJSON order is [lon, lat]
-                try:
-                    return (float(lat_val), float(lon_val))
-                except (ValueError, TypeError):
-                    continue
+    # 4. Fallback to measured design if recommended layer missing coords
+    designs = loc.get("designs", [])
+    if designs:
+        # Measured is typically index 0, but let's be explicit
+        measured_design = None
+        for design in designs:
+            if design.get("layerType") == "Measured":
+                measured_design = design
+                break
+        
+        if measured_design:
+            # Try structure.poleLocation first
+            pole_location = (
+                measured_design.get("structure", {})
+                .get("poleLocation", {})
+            )
+            c = _geo_coords(pole_location)
+            if c:
+                return c
+            
+            # Also try the same paths as recommended layer
+            for key in ("geographicCoordinate", "mapLocation"):
+                struct_geo = measured_design.get("structure", {}).get(key)
+                c = _geo_coords(struct_geo)
+                if c:
+                    return c
+
     # If nothing worked, return None
     return None
 
@@ -197,7 +247,130 @@ def _nearest_scid(sp_coord: Coord | None, kat_dict: Dict[str, dict], max_dist_m:
     return nearest
 
 # ---------------------------------------------------------------------------
-# main compare
+# advanced pole normalization and matching helpers
+# ---------------------------------------------------------------------------
+
+def _clean_digits(txt: str | None) -> str | None:
+    """Extract digits only and strip leading zeros for SCID comparison."""
+    if txt is None:
+        return None
+    digits = ''.join(ch for ch in str(txt) if ch.isdigit())
+    if not digits:
+        return None
+    return digits.lstrip('0') or '0'  # preserve single '0' if all zeros
+
+def _normalize_pole_num(pole_num: str | None) -> str | None:
+    """Normalize pole number by extracting digits and stripping leading zeros."""
+    if not pole_num:
+        return None
+    # Remove common prefixes and extract digits
+    clean = str(pole_num).upper().replace('PL', '')
+    digits = ''.join(ch for ch in clean if ch.isdigit())
+    if not digits:
+        return None
+    return digits.lstrip('0') or '0'
+
+def _extract_spec_components(spec: str | None) -> tuple[int | None, str | None, str | None]:
+    """Extract height, class, species from a pole spec string like '45-3 Southern Pine'."""
+    if not spec:
+        return None, None, None
+    
+    spec = str(spec).strip()
+    
+    # Try to parse format like "45-3 Southern Pine" or "45' Southern Pine"
+    import re
+    
+    # Pattern: height (with optional '), optional dash, class, species
+    pattern = r"^(\d+)[']*[-\s]*([A-Z0-9]*)\s*(.*)$"
+    match = re.match(pattern, spec, re.IGNORECASE)
+    
+    if match:
+        height_str, class_str, species_str = match.groups()
+        
+        try:
+            height = int(height_str)
+        except ValueError:
+            height = None
+            
+        pole_class = class_str.strip() if class_str.strip() else None
+        species = species_str.strip() if species_str.strip() else None
+        
+        return height, pole_class, species
+    
+    return None, None, None
+
+def _specs_match(spida_spec: str | None, kat_spec: str | None, height_tolerance_ft: int = 1) -> bool:
+    """Compare two pole specs for compatibility within tolerance."""
+    if not spida_spec or not kat_spec:
+        return False
+        
+    sp_height, sp_class, sp_species = _extract_spec_components(spida_spec)
+    kat_height, kat_class, kat_species = _extract_spec_components(kat_spec)
+    
+    # Height check (within tolerance)
+    if sp_height is not None and kat_height is not None:
+        if abs(sp_height - kat_height) > height_tolerance_ft:
+            return False
+    elif sp_height != kat_height:  # both None or one None
+        return False
+    
+    # Class check (exact match when both present)
+    if sp_class and kat_class:
+        if sp_class.upper() != kat_class.upper():
+            return False
+    elif sp_class != kat_class:  # both None or one None
+        return False
+    
+    # Species check is optional - we don't fail on species mismatch
+    # but we could add logging here if needed
+    
+    return True
+
+def _build_lookup_tables(kat_rows_by_scid: dict) -> tuple[dict, dict, dict]:
+    """Build optimized lookup tables for different matching tiers."""
+    scid_lookup = {}
+    pole_num_lookup = {}
+    coord_lookup = {}
+    
+    for scid, row_data in kat_rows_by_scid.items():
+        # SCID lookup (clean digits)
+        clean_scid = _clean_digits(scid)
+        if clean_scid:
+            scid_lookup[clean_scid] = row_data
+        
+        # Pole number lookup (normalized)
+        pole_num = row_data.get("Katapult Pole #")
+        norm_pole = _normalize_pole_num(pole_num)
+        if norm_pole:
+            pole_num_lookup[norm_pole] = row_data
+        
+        # Coordinate lookup (for spatial queries)
+        coord = row_data.get("Katapult Coord")
+        if coord:
+            # Round to 6 decimal places for lookup key (~0.1m precision)
+            coord_key = (round(coord[0], 6), round(coord[1], 6))
+            coord_lookup[coord_key] = row_data
+    
+    return scid_lookup, pole_num_lookup, coord_lookup
+
+def _find_closest_poles(sp_coord: Coord | None, kat_rows_by_scid: dict, max_dist_m: float = 5.0) -> list[tuple[str, dict, float]]:
+    """Find all Katapult poles within max_dist_m, sorted by distance."""
+    if not sp_coord:
+        return []
+    
+    candidates = []
+    for k_scid, row in kat_rows_by_scid.items():
+        k_coord = row.get("Katapult Coord")
+        if k_coord:
+            dist = _haversine_m(sp_coord, k_coord)
+            if dist <= max_dist_m:
+                candidates.append((k_scid, row, dist))
+    
+    # Sort by distance
+    return sorted(candidates, key=lambda x: x[2])
+
+# ---------------------------------------------------------------------------
+# main compare with tiered matching
 # ---------------------------------------------------------------------------
 def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
     """Return DataFrame with merged comparison."""
@@ -208,6 +381,61 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
     with spida_path.open("r", encoding="utf-8") as f:
         spida = json.load(f)
 
+    # Quick sanity-check: verify Charter attachments are found
+    owners = _owners_table(spida)
+    test_hits = [
+        (att.get("catalog", {}).get("code", "N/A"), att.get("usageGroup", "N/A"))
+        for lead in spida["leads"]
+        for loc  in lead["locations"]
+        for des  in loc["designs"]
+        if des["layerType"] == "Recommended"
+        for att  in _iter_all_attachments(des["structure"])
+        if "charter" in (att.get("owner", {}).get("id") or owners.get(att.get("ownerId",""), "")).lower()
+    ]
+    if test_hits:
+        print(f"✅ {len(test_hits)} Charter attachments found in SPIDA file")
+    else:
+        print("⚠️  No Charter attachments found in SPIDA file")
+
+    # ---------------- build SPIDA alias table ----------------
+    alias_table = {}
+    client_data = spida.get("clientData", {})
+    poles = client_data.get("poles", [])
+    
+    for pole in poles:
+        # Get pole specifications
+        height_raw = pole.get("height", {})
+        if isinstance(height_raw, dict):
+            height_val = height_raw.get("value")
+            if height_val:
+                height_ft = round(height_val / 0.3048)  # Convert meters to feet
+            else:
+                height_ft = None
+        else:
+            height_ft = _to_feet(height_raw)
+            
+        pole_class = pole.get("classOfPole") or pole.get("class", "")
+        species = pole.get("species", "")
+        
+        # Build the full spec string
+        if height_ft and pole_class and species:
+            full_spec = f"{height_ft}'-{pole_class} {species}"
+        elif height_ft and species:
+            full_spec = f"{height_ft}' {species}"
+        elif pole_class and species:
+            full_spec = f"{pole_class} {species}"
+        else:
+            full_spec = species or None
+            
+        # Map all aliases for this pole to the full spec
+        for alias_obj in pole.get("aliases", []):
+            alias_id = alias_obj.get("id")
+            if alias_id and full_spec:
+                alias_table[alias_id] = full_spec
+
+    print(f"📋 Built alias table with {len(alias_table)} pole specifications")
+
+    # ---------------- process SPIDA locations ----------------
     sp_rows: List[dict] = []
     scid_counter = 0
     sp_charter_scids: set[str] = set()
@@ -227,7 +455,7 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
             recommended = next(d for d in loc["designs"] if d["layerType"] == "Recommended")
 
             pole_struct = recommended["structure"]["pole"]
-            sp_spec = _build_spida_spec(pole_struct) or ""
+            sp_spec = _build_spida_spec(pole_struct, alias_table) or ""
 
             # loading %
             def _get_load(design):
@@ -240,13 +468,12 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
             sp_exist = _get_load(measured)
             sp_final = _get_load(recommended)
 
-            # Charter drop flag
+            # Charter drop flag - comprehensive detection using helper functions
             charter = any(
-                item.get("owner", {}).get("industry") == "COMMUNICATION" and
-                item.get("owner", {}).get("id") == "Charter" and
-                item.get("clientItem", {}).get("type", "").lower().endswith("drop")
-                for item in recommended["structure"].get("attachments", [])
+                _is_charter_service(att, owners)
+                for att in _iter_all_attachments(recommended["structure"])
             )
+
             if charter:
                 sp_charter_scids.add(scid)
 
@@ -367,32 +594,38 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
                     # Check if it already starts with PL to avoid double prefix
                     pole_num = tagtext if str(tagtext).startswith('PL') else f"PL{tagtext}"
         
-        # Extract pole spec from birthmarks
+        # Extract pole spec from attributes - try direct pole_spec first
         kat_spec = None
-        # Look for birthmark reference in node attributes
-        birthmark_ref = None
-        for key in attrs.keys():
-            if 'birthmark' in key.lower() or 'spec' in key.lower():
-                # Use _get_imported_val to handle Katapult's nested attribute structure
-                birthmark_ref = _get_imported_val(attrs.get(key))
-                if birthmark_ref:
-                    break
         
-        if birthmark_ref and isinstance(birthmark_ref, str) and birthmark_ref in birthmarks:
-            spec_data = birthmarks[birthmark_ref]
-            height = spec_data.get('height')
-            klass = spec_data.get('class')
-            species = spec_data.get('species')
-            if height and klass and species:
-                kat_spec = f"{height}'-{klass} {species}"
-        
-        # Fallback to old method if birthmark not found
-        if not kat_spec:
-            height_raw = _first_val(attrs.get("pole_height")) or _first_val(attrs.get("poleLength")) or _first_val(attrs.get("Height"))
-            klass      = _first_val(attrs.get("pole_class")) or _first_val(attrs.get("Class"))
-            species    = _first_val(attrs.get("pole_species")) or _first_val(attrs.get("Species"))
-            feet = _to_feet(height_raw)
-            kat_spec = f"{feet}'-{klass} {species}" if all([feet, klass, species]) else None
+        # ⬇️ NEW: Direct check for pole_spec before birthmark logic
+        spec_raw = _get_imported_val(attrs.get("pole_spec"))
+        if spec_raw:              # already a finished spec like "45-3 Southern Pine"
+            kat_spec = str(spec_raw)
+        else:
+            # ⬇️ EXISTING: Look for birthmark reference in node attributes
+            birthmark_ref = None
+            for key in attrs.keys():
+                if 'birthmark' in key.lower() or 'spec' in key.lower():
+                    # Use _get_imported_val to handle Katapult's nested attribute structure
+                    birthmark_ref = _get_imported_val(attrs.get(key))
+                    if birthmark_ref:
+                        break
+            
+            if birthmark_ref and isinstance(birthmark_ref, str) and birthmark_ref in birthmarks:
+                spec_data = birthmarks[birthmark_ref]
+                height = spec_data.get('height')
+                klass = spec_data.get('class')
+                species = spec_data.get('species')
+                if height and klass and species:
+                    kat_spec = f"{height}'-{klass} {species}"
+            
+            # Fallback to old method if birthmark not found
+            if not kat_spec:
+                height_raw = _first_val(attrs.get("pole_height")) or _first_val(attrs.get("poleLength")) or _first_val(attrs.get("Height"))
+                klass      = _first_val(attrs.get("pole_class")) or _first_val(attrs.get("Class"))
+                species    = _first_val(attrs.get("pole_species")) or _first_val(attrs.get("Species"))
+                feet = _to_feet(height_raw)
+                kat_spec = f"{feet}'-{klass} {species}" if all([feet, klass, species]) else None
 
         ex_pct = _first_val(attrs.get("existing_capacity_%"))
         fi_pct = _first_val(attrs.get("final_passing_capacity_%"))
@@ -405,9 +638,9 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
             "Katapult SCID #": scid,  # expose raw Katapult SCID as optional visible column
             "Katapult Pole #": pole_num,
             "Katapult Spec": kat_spec,
-            "Katapult Existing %": f"{ex_pct}%" if ex_pct else None,
-            "Katapult Final %": f"{fi_pct}%" if fi_pct else None,
-            "Katapult Charter Drop": scid in kat_charter_scids,
+            "Katapult Existing %": _fmt_pct(ex_pct),
+            "Katapult Final %": _fmt_pct(fi_pct),
+            "Katapult Charter Drop": scid in kat_com_drop_scids,  # True if ANY service location exists
             "Com Drop?": "Yes" if scid in kat_com_drop_scids else "No",
             "Katapult Coord": coord
         }
@@ -421,6 +654,9 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
 
         # Track the official SCID once (avoid dup keys from digits mapping)
         kat_scid_set.add(scid)
+
+    # ---------------- build optimized lookup tables ----------------
+    scid_lookup, pole_num_lookup, coord_lookup = _build_lookup_tables(kat_rows_by_scid)
 
     # ---------------- prepare list comparisons ----------------
     # Collect all SCIDs and pole numbers
@@ -439,28 +675,68 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
     poles_only_in_katapult = set(katapult_pole_nums) - set(spida_pole_nums)
     poles_in_both = set(spida_pole_nums) & set(katapult_pole_nums)
 
-    # ---------------- merge into df ----------------
+    # ---------------- merge into df with tiered matching ----------------
     merged_rows: List[dict] = []
+    match_stats = {
+        'scid': 0,
+        'pole_num': 0, 
+        'coord_direct': 0,
+        'coord_spec_verified': 0,
+        'unmatched': 0
+    }
+    
     for sp in sp_rows:
         scid = sp["SCID"]
         sp_pole_num = sp.get("SPIDA Pole #")
-        sp_coord = sp.get("SPIDA Coord")  # needed for coord fallback
-
-        # Tier 1 — SCID ↔ SCID ------------------------------------------------
-        kdat = kat_rows_by_scid.get(scid)
-
-        # Tier 2 — pole-ID equality -----------------------------------------
+        sp_coord = sp.get("SPIDA Coord")
+        sp_spec = sp.get("SPIDA Spec")
+        
+        kdat = None
+        match_tier = None
+        match_distance = None
+        
+        # ==================== TIER 1: EXACT SCID MATCH ====================
+        clean_spida_scid = _clean_digits(scid)
+        if clean_spida_scid and clean_spida_scid in scid_lookup:
+            kdat = scid_lookup[clean_spida_scid]
+            match_tier = 'scid'
+            match_stats['scid'] += 1
+        
+        # ==================== TIER 2: POLE NUMBER MATCH ====================
         if not kdat:
-            kdat = kat_rows_by_scid.get(sp_pole_num)
+            norm_spida_pole = _normalize_pole_num(sp_pole_num)
+            if norm_spida_pole and norm_spida_pole in pole_num_lookup:
+                kdat = pole_num_lookup[norm_spida_pole]
+                match_tier = 'pole_num'
+                match_stats['pole_num'] += 1
+        
+        # ==================== TIER 3 & 4: COORDINATE + SPEC MATCHING ====================
+        if not kdat and sp_coord:
+            closest_poles = _find_closest_poles(sp_coord, kat_rows_by_scid, max_dist_m=5.0)
+            
+            for kat_scid, candidate_data, distance in closest_poles:
+                # Tier 3a: Direct match if < 1m
+                if distance < 1.0:
+                    kdat = candidate_data
+                    match_tier = 'coord_direct'
+                    match_distance = distance
+                    match_stats['coord_direct'] += 1
+                    break
+                
+                # Tier 3b + 4: Candidate match (1-5m) requires spec verification
+                elif distance <= 5.0:
+                    kat_spec = candidate_data.get("Katapult Spec")
+                    if _specs_match(sp_spec, kat_spec):
+                        kdat = candidate_data
+                        match_tier = 'coord_spec_verified'
+                        match_distance = distance
+                        match_stats['coord_spec_verified'] += 1
+                        break
+        
+        # ==================== HANDLE UNMATCHED POLES ====================
         if not kdat:
-            kdat = kat_rows_by_scid.get(_digits_only(sp_pole_num))
-
-        # Tier 3 — nearest coordinate within radius -------------------------
-        match_scid = None
-        if not kdat:
-            match_scid = _nearest_scid(sp_coord, kat_rows_by_scid, max_dist_m=5.0)
-            if match_scid:
-                kdat = kat_rows_by_scid.get(match_scid)
+            match_tier = 'unmatched'
+            match_stats['unmatched'] += 1
 
         krow = kdat or {}
 
@@ -484,6 +760,10 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
         if "Katapult Coord" not in row:
             row["Katapult Coord"] = None
             
+        # ==================== ADD MATCH METADATA ====================
+        row["Match Tier"] = match_tier
+        row["Match Distance (m)"] = f"{match_distance:.2f}" if match_distance is not None else None
+        
         # Add comparison columns
         row["Spec Match"] = row.get("SPIDA Spec") == row.get("Katapult Spec")
         row["Existing % Match"] = row.get("SPIDA Existing %") == row.get("Katapult Existing %")
@@ -512,32 +792,53 @@ def compare(spida_path: Path | str, kat_path: Path | str) -> pd.DataFrame:
         else:
             row["Pole # Status"] = "No Pole #"
         
-        # Flag if this row was matched purely by coordinate proximity
-        row["Matched by Coord"] = bool(match_scid)
+        # Legacy flag for backward compatibility
+        row["Matched by Coord"] = match_tier in ['coord_direct', 'coord_spec_verified']
         
         merged_rows.append(row)
 
-    # Add rows for Katapult-only SCIDs
-    for scid in scids_only_in_katapult:
-        krow = kat_rows_by_scid[scid]
-        row = {
-            "SCID": scid,
-            "SPIDA Pole #": None,
-            "SPIDA Spec": None,
-            "SPIDA Existing %": None,
-            "SPIDA Final %": None,
-            "SPIDA Charter Drop": False,
-            "SPIDA Coord": None,
-            **krow,
-            "Matched by Coord": False,
-            "Spec Match": False,
-            "Existing % Match": False,
-            "Final % Match": False,
-            "Charter Drop Match": False,
-            "SCID Status": "Katapult Only",
-            "Pole # Status": "Katapult Only" if krow.get("Katapult Pole #") else "No Pole #"
-        }
-        merged_rows.append(row)
+    # ==================== ADD KATAPULT-ONLY POLES ====================
+    matched_katapult_scids = set()
+    for row in merged_rows:
+        if row.get("Katapult SCID #"):
+            matched_katapult_scids.add(row["Katapult SCID #"])
+    
+    for scid in kat_scid_set:
+        if scid not in matched_katapult_scids:
+            krow = kat_rows_by_scid[scid]
+            row = {
+                "SCID": scid,
+                "SPIDA Pole #": None,
+                "SPIDA Spec": None,
+                "SPIDA Existing %": None,
+                "SPIDA Final %": None,
+                "SPIDA Charter Drop": False,
+                "SPIDA Coord": None,
+                **krow,
+                "Match Tier": "katapult_only",
+                "Match Distance (m)": None,
+                "Matched by Coord": False,
+                "Spec Match": False,
+                "Existing % Match": False,
+                "Final % Match": False,
+                "Charter Drop Match": False,
+                "SCID Status": "Katapult Only",
+                "Pole # Status": "Katapult Only" if krow.get("Katapult Pole #") else "No Pole #"
+            }
+            merged_rows.append(row)
+    
+    # ==================== REPORT MATCH STATISTICS ====================
+    total_spida_poles = len(sp_rows)
+    total_matches = sum(match_stats[key] for key in ['scid', 'pole_num', 'coord_direct', 'coord_spec_verified'])
+    match_rate = (total_matches / total_spida_poles * 100) if total_spida_poles > 0 else 0
+    
+    print(f"\n📊 Tiered Matching Results:")
+    print(f"   🎯 Tier 1 (SCID): {match_stats['scid']} poles")
+    print(f"   🏷️  Tier 2 (Pole #): {match_stats['pole_num']} poles")
+    print(f"   📍 Tier 3a (Coord <1m): {match_stats['coord_direct']} poles")
+    print(f"   🔍 Tier 3b+4 (Coord+Spec): {match_stats['coord_spec_verified']} poles")
+    print(f"   ❌ Unmatched: {match_stats['unmatched']} poles")
+    print(f"   ✅ Overall match rate: {match_rate:.1f}% ({total_matches}/{total_spida_poles})")
 
     return pd.DataFrame(merged_rows)
 
@@ -550,48 +851,61 @@ def haversine_m(p1: Coord, p2: Coord) -> float:
 # spec builder helper
 # ---------------------------------------------------------------------------
 
-def _build_spida_spec(pole_struct: dict) -> str | None:
-    """Return a human-friendly pole spec string.
+def _build_spida_spec(pole_struct: dict, alias_table: dict) -> str | None:
+    """Return a human-friendly pole spec string following the exact SPIDA algorithm.
 
     Priority order:
-    1. ``clientItemAlias`` if present – formats like ``50-2`` or ``45``.
+    1. ``clientItemAlias`` if present – resolved via alias_table OR parsed directly
     2. Height / class / species fields in ``clientItem``.
     """
+    # -- 1. Alias handling with table lookup --------------------------------------------------
+    alias = pole_struct.get("clientItemAlias")
+    if alias and alias in alias_table:
+        return alias_table[alias]  # Fast path: direct lookup from alias table
+    
+    # -- 2. Direct alias parsing (improved) --------------------------------------------------
+    if isinstance(alias, str) and alias.strip():
+        pb = pole_struct.get("clientItem", {})
+        species = pb.get("species") or ""
+        
+        alias_clean = alias.strip().replace("\u2032", "'")  # convert prime char if present
+        
+        # Check if alias has the standard "XX-Y" format
+        if "-" in alias_clean:
+            parts = alias_clean.split("-", 1)
+            height_part = parts[0].rstrip("'")
+            class_part = parts[1] if len(parts) > 1 else ""
+            
+            if height_part.isdigit() and class_part:
+                # Standard format like "45-3"
+                return f"{height_part}′-{class_part} {species}".strip()
+        
+        # If not standard format, fall back to raw field construction
+
+    # -- 3. Height / class / species construction from raw fields -------------------------------
     pb = pole_struct.get("clientItem", {})
     species = pb.get("species") or ""
-
-    # -- 1. Alias handling --------------------------------------------------
-    alias = pole_struct.get("clientItemAlias")
-    if isinstance(alias, str) and alias.strip():
-        alias_clean = alias.strip().replace("\u2032", "'")  # convert prime char if present
-        parts = alias_clean.split("-", 1)
-        length_ft_raw = parts[0].rstrip("'")
-        if length_ft_raw.isdigit():
-            length_ft = length_ft_raw  # numeric feet length
-            if len(parts) == 2 and parts[1]:
-                pole_class = parts[1]
-                alias_fmt = f"{length_ft}'-{pole_class}"
-            else:
-                alias_fmt = f"{length_ft}'"
-            return f"{alias_fmt} {species}".strip()
-        # If alias isn't strictly numeric first, fall back further below
-
-    # -- 2. Height / class / species fallback -------------------------------
+    
     height_raw = pb.get("height")
     if isinstance(height_raw, dict):
         height_val = height_raw.get("value")
+        unit = str(height_raw.get("unit", "")).lower()
+        
+        # Convert to feet using the fixed _to_feet function
+        feet = _to_feet(height_raw)
     else:
-        height_val = height_raw
-    feet = _to_feet(height_val)
+        feet = _to_feet(height_raw)
 
     pole_class = pb.get("classOfPole") or pb.get("class") or ""
 
+    # Build spec string in the standard format
     if feet is not None and pole_class and species:
-        return f"{feet}'-{pole_class} {species}"
-    if feet is not None and species:
-        return f"{feet}' {species}"
-    if pole_class and species:
+        return f"{feet}′-{pole_class} {species}"
+    elif feet is not None and species:
+        return f"{feet}′ {species}"
+    elif pole_class and species:
         return f"{pole_class} {species}"
+    
     return species or None
 
 def _collect_birthmarks(obj, out):
@@ -605,3 +919,43 @@ def _collect_birthmarks(obj, out):
     elif isinstance(obj, list):
         for el in obj:
             _collect_birthmarks(el, out)
+
+# ---------------------------------------------------------------------------
+# Charter service drop detection helpers
+# ---------------------------------------------------------------------------
+
+# --- SPIDA look-ups that are sometimes needed -----------------
+def _owners_table(spida_json: dict) -> dict[str,str]:
+    """Map ownerId→ownerName (Charter, AT&T, etc.)."""
+    owners = {}
+    for lead in spida_json.get("leads", []):
+        for o in lead.get("owners", []):
+            owners[o["id"]] = o.get("name", o["id"])
+    return owners
+
+def _iter_all_attachments(struct: dict):
+    """Attachments, wires *and* spans – v11 uses all three."""
+    for key in ("attachments", "wires", "spans"):
+        yield from struct.get(key, [])
+    for node in struct.get("nodes", []):
+        for key in ("attachments", "wires", "spans"):
+            yield from node.get(key, [])
+
+def _is_charter_service(att: dict, owners: dict[str,str]) -> bool:
+    """Check if attachment is a Charter service drop using broad heuristics."""
+    owner_id = att.get("owner", {}).get("id") or owners.get(att.get("ownerId",""), "")
+    owner_id = owner_id.lower()
+    if "charter" not in owner_id:
+        return False                    # not Charter
+
+    # broad service-drop heuristics
+    ug   = str(att.get("usageGroup", "")).lower()
+    ctyp = str(att.get("clientItem", {}).get("type", "")).lower()
+    code = str(att.get("catalog", {}).get("code", "")).upper()
+
+    return (
+        "service" in ug                 # COMMUNICATION_SERVICE, …_SERVICE_DROP, etc.
+        or ctyp.endswith("drop")        # older clientItem types
+        or "FSV0250" in code            # Charter's 0.25-inch fibre
+        or att.get("serviceDrop") is True  # v11 boolean flag
+    )
