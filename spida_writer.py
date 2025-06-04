@@ -40,9 +40,11 @@ def apply_edit(spida: dict, scid: str, column: str, new_val: str):
             return  # once patched → done
 
 def _update_pole_spec(pole: dict, new_val: str):
-    """Parse and update pole specification string like '40' H1 Southern Pine'."""
+    """Parse and update pole specification string like "40' H1 Southern Pine"."""
     try:
-        parts = new_val.strip().split("'", 1)
+        # Normalize prime character to plain apostrophe for easier splitting
+        cleaned = new_val.replace("\u2032", "'")
+        parts = cleaned.strip().split("'", 1)
         if len(parts) < 2:
             return
             
